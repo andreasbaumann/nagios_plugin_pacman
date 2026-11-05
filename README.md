@@ -20,6 +20,10 @@ It depends on the standard Nagios plugin helper library `utils.sh`, which
 is expected to live alongside the script (not included in this repo) and
 provides `print_revision`, `support`, and the `STATE_*` exit codes.
 
+## Screenshot
+
+![pacman nagios check](pacman.png)
+
 ## Why
 
 Other projects:
