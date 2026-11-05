@@ -22,7 +22,13 @@ provides `print_revision`, `support`, and the `STATE_*` exit codes.
 
 ## Screenshot
 
+Basic check with kernel check and needrestart:
+
 ![pacman nagios check](pacman.png)
+
+Extended check with CVEs:
+
+![pacman nagios check with CVEs](CVEs.png)
 
 ## Why
 
