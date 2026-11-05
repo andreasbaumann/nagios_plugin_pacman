@@ -1,0 +1,406 @@
+#!/bin/sh
+#
+# Pacman update checking plugin for ArchLinux and derivates
+# Written by Andreas Baumann (mail@andreasbaumann.cc)
+#
+# Usage: ./nagios-pacman-check
+
+PATH="/usr/local/sbin:/usr/local/bin:/sbin:/bin:/usr/sbin:/usr/bin"
+PROGNAME=`basename $0`
+PROGPATH=`echo $0 | sed -e 's,[\\/][^\\/][^\\/]*$,,'`
+REVISION="0.1"
+
+. $PROGPATH/utils.sh
+
+# Arch Linux security tracker (JSON API, not scraped) used to cross-reference
+# pending updates and installed packages against known CVEs/advisories.
+SECURITY_URL="https://security.archlinux.org/issues/all.json"
+SECURITY_CACHE="/var/tmp/nagios-pacman-check-security.json"
+SECURITY_CACHE_MAX_AGE_MIN=360
+
+SECURITY_MODE="all"
+MIN_SEVERITY_RANK=0
+CACHE_ONLY=0
+CHECK_KERNEL=0
+CHECK_RESTART=0
+
+severity_rank() {
+	case "`echo "$1" | tr 'A-Z' 'a-z'`" in
+		critical) echo 4 ;;
+		high) echo 3 ;;
+		medium) echo 2 ;;
+		low) echo 1 ;;
+		*) echo 0 ;;
+	esac
+}
+
+# more severe of two Nagios state codes: OK < WARNING < UNKNOWN < CRITICAL
+worse_state() {
+	rank() {
+		case "$1" in
+			$STATE_OK) echo 0 ;;
+			$STATE_WARNING) echo 1 ;;
+			$STATE_UNKNOWN) echo 2 ;;
+			$STATE_CRITICAL) echo 3 ;;
+		esac
+	}
+	ra=`rank "$1"`
+	rb=`rank "$2"`
+	if test "$ra" -ge "$rb"; then echo "$1"; else echo "$2"; fi
+}
+
+# running vs. installed kernel package version, same comparison as
+# the standalone nagios-arch-installed-kernel plugin
+check_kernel() {
+	kernel_mismatch=0
+	arch=`uname -m`
+	case "$arch" in
+		armv6l|armv7l)
+			kpkgs="linux-rpi linux-raspberrypi linux-raspberrypi4 linux-rpi-legacy"
+			;;
+		aarch64)
+			kpkgs="linux-aarch64 linux-rpi linux-raspberrypi4"
+			;;
+		i686|x86_64)
+			kpkgs="linux linux-lts"
+			;;
+		*)
+			kernel_text="kernel: unsupported arch $arch"
+			return
+			;;
+	esac
+
+	running=`uname -r | cut -f 1 -d -`
+	installed=""
+	for pkg in $kpkgs; do
+		installed=`pacman -Qi "$pkg" 2>/dev/null | grep Version | cut -f 2 -d : | tr -d ' ' | cut -f 1 -d - | cut -f 1-3 -d .`
+		test -n "$installed" && break
+	done
+
+	if test -z "$installed"; then
+		kernel_text="kernel: running $running, installed kernel package not found (tried: $kpkgs)"
+		return
+	fi
+
+	kernel_text="kernel: running $running, installed $installed"
+	if test "$installed" != "$running"; then
+		kernel_mismatch=1
+		kernel_text="$kernel_text (reboot needed)"
+	fi
+}
+
+print_usage() {
+        echo "Usage: $PROGNAME [--unpatched-only|--fixes-only|--no-security] [--min-severity=critical|high|medium|low] [--cache-only] [--check-kernel] [--check-restart]"
+}
+
+print_help() {
+	print_revision $PROGNAME $REVISION
+	echo ""
+	print_usage
+	echo ""
+	echo "This plugin checks pacman updates to be ready to install."
+	echo "It also cross-references pending/installed packages against"
+	echo "the Arch Linux security tracker ($SECURITY_URL)."
+	echo ""
+	echo "  --unpatched-only       only report installed packages with a"
+	echo "                         known, currently unpatched vulnerability"
+	echo "  --fixes-only           only report pending updates that fix a"
+	echo "                         tracked CVE"
+	echo "  --no-security          skip the security tracker entirely"
+	echo "  --min-severity=LEVEL   only show/count critical, high, medium or"
+	echo "                         low severity entries (and anything more"
+	echo "                         severe); default: show everything"
+	echo "  --cache-only           do not run 'sudo pacman -Sy'; check"
+	echo "                         'pacman -Qu' against whatever sync db"
+	echo "                         is already on disk"
+	echo "  --check-kernel         also warn if the running kernel differs"
+	echo "                         from the installed kernel package (same"
+	echo "                         check as nagios-arch-installed-kernel)"
+	echo "  --check-restart        also run 'sudo needrestart -p' (needs"
+	echo "                         needrestart installed) for a full"
+	echo "                         services/sessions/containers restart"
+	echo "                         check, folding its state into ours"
+	echo ""
+	support
+	exit $STATE_OK
+}
+
+while test $# -gt 0; do
+	case "$1" in
+		--help|-h)
+			print_help
+			exit $STATE_OK
+			;;
+		--version|-V)
+			print_revision $PROGNAME $REVISION
+			exit $STATE_OK
+			;;
+		--unpatched-only)
+			SECURITY_MODE="unpatched"
+			;;
+		--fixes-only)
+			SECURITY_MODE="fixes"
+			;;
+		--no-security)
+			SECURITY_MODE="none"
+			;;
+		--min-severity=*)
+			MIN_SEVERITY_RANK=`severity_rank "${1#--min-severity=}"`
+			;;
+		--cache-only)
+			CACHE_ONLY=1
+			;;
+		--check-kernel)
+			CHECK_KERNEL=1
+			;;
+		--check-restart)
+			CHECK_RESTART=1
+			;;
+		*)
+			print_usage 1>&2
+			exit $STATE_UNKNOWN
+			;;
+	esac
+	shift
+done
+
+run_unpatched=0
+run_fixes=0
+case "$SECURITY_MODE" in
+	all)
+		run_unpatched=1
+		run_fixes=1
+		;;
+	unpatched)
+		run_unpatched=1
+		;;
+	fixes)
+		run_fixes=1
+		;;
+esac
+
+if test "$CACHE_ONLY" -eq 0; then
+	pacman_sync=`mktemp`
+	sudo pacman -Sy >${pacman_sync} 2>&1
+	status=$?
+	if test ${status} -ne 0; then
+		text="UNKNOWN - pacman -Sy failed with state $status"
+		exit=$STATE_UNKNOWN
+		echo "$text"
+		exit $exit
+	fi
+	rm -f "${pacman_sync}"
+fi
+
+pacman_updates=`mktemp`
+pacman -Qu >${pacman_updates} 2>&1
+status=$?
+if test ${status} -ne 0; then
+	text="UNKNOWN - pacman -Qu failed with status $status"
+	exit=$STATE_UNKNOWN
+fi
+nof_updates=`wc -l $pacman_updates | cut -f 1 -d ' '`
+nof_ignores=`grep -c '\[ignored\]' $pacman_updates`
+if test "$nof_ignores" -gt 0; then
+	exit=$STATE_WARNING
+	nof_updates=`expr $nof_updates - $nof_ignores`
+fi
+
+# refresh (or reuse a recent) local copy of the security tracker feed
+security_available=0
+if test "$SECURITY_MODE" != "none"; then
+	if test -s "$SECURITY_CACHE" -a -n "`find "$SECURITY_CACHE" -mmin -$SECURITY_CACHE_MAX_AGE_MIN 2>/dev/null`"; then
+		security_available=1
+	else
+		security_tmp=`mktemp`
+		if curl -s -m 15 -o "$security_tmp" "$SECURITY_URL" && test -s "$security_tmp"; then
+			mv -f "$security_tmp" "$SECURITY_CACHE"
+			security_available=1
+		else
+			rm -f "$security_tmp"
+			test -s "$SECURITY_CACHE" && security_available=1
+		fi
+	fi
+fi
+security_json="$SECURITY_CACHE"
+
+# installed packages with a known, currently unpatched vulnerability
+# (tracker status "Vulnerable": no fixed version exists yet)
+nof_unpatched=0
+nof_critical_unpatched=0
+unpatched_list=`mktemp`
+if test "$security_available" -eq 1 -a "$run_unpatched" -eq 1; then
+	installed_pkgs=`mktemp`
+	pacman -Qq >"$installed_pkgs"
+	unpatched_matches=`mktemp`
+	jq -r --rawfile instraw "$installed_pkgs" '
+		($instraw | split("\n") | map(select(length>0))) as $inst
+		| .[]
+		| select(.status=="Vulnerable")
+		| select(.packages | any(. as $p | $inst | index($p) != null))
+		| "\(.severity)|\([.packages[] | select(. as $p | $inst | index($p) != null)] | join(","))|\(.issues | join(","))"
+	' "$security_json" >"$unpatched_matches" 2>/dev/null
+	while IFS='|' read -r severity pkgs issues; do
+		test -z "$severity" && continue
+		if test "$severity" = "Critical"; then
+			nof_critical_unpatched=`expr $nof_critical_unpatched + 1`
+		fi
+		rank=`severity_rank "$severity"`
+		if test "$rank" -ge "$MIN_SEVERITY_RANK"; then
+			nof_unpatched=`expr $nof_unpatched + 1`
+			echo "$pkgs [$severity] $issues (unpatched, no fix yet)" >>"$unpatched_list"
+		fi
+	done <"$unpatched_matches"
+	rm -f "$installed_pkgs" "$unpatched_matches"
+fi
+
+relevant=0
+less_relevant=0
+nof_security_fixes=0
+repo_list=`mktemp`
+detail_list=`mktemp`
+if test -s "$pacman_updates"; then
+	while read -r pkgline; do
+		case "$pkgline" in
+			*"[ignored]"*)
+				echo "$pkgline" >>"$detail_list"
+				continue
+				;;
+		esac
+		pkgname=`echo "$pkgline" | awk '{print $1}'`
+		test -z "$pkgname" && continue
+		oldver=`echo "$pkgline" | awk '{print $2}'`
+
+		repo=`pacman -Si "$pkgname" 2>/dev/null | awk -F': ' '/^Repository/ {print $2}'`
+		if test -n "$repo"; then
+			relevant=`expr $relevant + 1`
+			echo "$repo" >>"$repo_list"
+			tag="$repo"
+		else
+			less_relevant=`expr $less_relevant + 1`
+			echo "foreign/AUR" >>"$repo_list"
+			tag="foreign/AUR"
+		fi
+
+		# does this pending update fix a tracked, known CVE?
+		cve_fix=""
+		if test "$security_available" -eq 1 -a "$run_fixes" -eq 1; then
+			cve_matches=`mktemp`
+			jq -r --arg pkg "$pkgname" '
+				.[] | select(.status=="Fixed") | select(.packages | index($pkg) != null) |
+				"\(.affected)|\(.severity)|\(.issues | join(","))"
+			' "$security_json" >"$cve_matches" 2>/dev/null
+			while IFS='|' read -r affected severity issues; do
+				test -z "$affected" && continue
+				if test `vercmp "$oldver" "$affected"` -le 0; then
+					rank=`severity_rank "$severity"`
+					if test "$rank" -ge "$MIN_SEVERITY_RANK"; then
+						cve_fix="$cve_fix $issues($severity)"
+					fi
+				fi
+			done <"$cve_matches"
+			rm -f "$cve_matches"
+			cve_fix=`echo "$cve_fix" | sed -e 's/^ *//'`
+		fi
+		if test -n "$cve_fix"; then
+			nof_security_fixes=`expr $nof_security_fixes + 1`
+			tag="$tag, fixes $cve_fix"
+		fi
+
+		echo "$pkgline [$tag]" >>"$detail_list"
+	done <"$pacman_updates"
+fi
+
+repo_breakdown=""
+if test -s "$repo_list"; then
+	repo_breakdown=`sort "$repo_list" | uniq -c | awk '{print $2": "$1}' | paste -sd',' - | sed 's/,/, /g'`
+fi
+rm -f "$repo_list"
+
+kernel_mismatch=0
+kernel_text=""
+if test "$CHECK_KERNEL" -eq 1; then
+	check_kernel
+fi
+
+restart_exit=$STATE_OK
+restart_text=""
+restart_detail=`mktemp`
+if test "$CHECK_RESTART" -eq 1; then
+	if command -v needrestart >/dev/null 2>&1; then
+		needrestart_out=`mktemp`
+		sudo needrestart -p >"$needrestart_out" 2>&1
+		needrestart_line1=`head -n 1 "$needrestart_out"`
+		tail -n +2 "$needrestart_out" >"$restart_detail"
+		rm -f "$needrestart_out"
+
+		# needrestart's own verdict (incl. its exit code) can be UNKNOWN
+		# purely because it can't map our kernel package naming
+		# (Arch/RPi) to a version, or find x86 microcode info on ARM -
+		# that's expected on this fleet and must not drag the whole
+		# check to UNKNOWN. Re-derive our own restart state from the
+		# Services/Containers/Sessions counts it reports and ignore its
+		# Kernel/Microcode sub-verdict (kernel staleness is already
+		# covered by --check-kernel/check_kernel above).
+		services_n=`echo "$needrestart_line1" | sed -n 's/.*Services: \([0-9][0-9]*\).*/\1/p'`
+		containers_n=`echo "$needrestart_line1" | sed -n 's/.*Containers: \([0-9][0-9]*\).*/\1/p'`
+		sessions_n=`echo "$needrestart_line1" | sed -n 's/.*Sessions: \([0-9][0-9]*\).*/\1/p'`
+		test -z "$services_n" && services_n=0
+		test -z "$containers_n" && containers_n=0
+		test -z "$sessions_n" && sessions_n=0
+
+		restart_text=`echo "$needrestart_line1" | sed -e 's/^[A-Z]* - //' -e 's/Kernel: [^,]*, Microcode: [^,]*, //' -e 's/|.*//'`
+		if test "$services_n" -gt 0 -o "$containers_n" -gt 0 -o "$sessions_n" -gt 0; then
+			restart_exit=$STATE_WARNING
+		else
+			restart_exit=$STATE_OK
+		fi
+	else
+		restart_text="restart-check: needrestart not installed"
+		restart_exit=$STATE_UNKNOWN
+	fi
+fi
+
+text="$nof_updates updates, $nof_ignores ignored"
+if test "$nof_updates" -gt 0; then
+	text="$text ($relevant relevant, $less_relevant less relevant; $repo_breakdown)"
+fi
+if test "$nof_security_fixes" -gt 0; then
+	text="$text, $nof_security_fixes fix known CVEs"
+fi
+if test "$nof_unpatched" -gt 0; then
+	text="$text, $nof_unpatched unpatched known vulnerabilities"
+fi
+if test "$SECURITY_MODE" != "none" -a "$security_available" -ne 1; then
+	text="$text (security advisory data unavailable)"
+fi
+if test "$CHECK_KERNEL" -eq 1; then
+	text="$text, $kernel_text"
+fi
+if test "$CHECK_RESTART" -eq 1; then
+	text="$text, $restart_text"
+fi
+
+if test "$nof_critical_unpatched" -gt 0; then
+	exit=$STATE_CRITICAL
+elif test "$nof_updates" -gt 0 -o "$nof_unpatched" -gt 0 -o "$kernel_mismatch" -eq 1; then
+	exit=$STATE_WARNING
+else
+	exit=$STATE_OK
+fi
+if test "$CHECK_RESTART" -eq 1; then
+	exit=`worse_state "$exit" "$restart_exit"`
+fi
+
+echo "$text"
+if test -s "$detail_list"; then
+	cat "$detail_list"
+fi
+if test -s "$unpatched_list"; then
+	cat "$unpatched_list"
+fi
+if test -s "$restart_detail"; then
+	cat "$restart_detail"
+fi
+rm -f "$detail_list" "$unpatched_list" "$restart_detail"
+exit $exit
